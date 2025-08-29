@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<title>AR Recolor – ściany na żywo</title>
+<style>
+  html,body { margin:0; padding:0; background:#000; color:#fff; font-family:system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  #wrap { position:relative; width:100vw; height:100vh; overflow:hidden; }
+  video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+  #hud { position:absolute; left:12px; top:12px; background:rgba(0,0,0,.45); padding:10px 12px; border-radius:10px; font-size:13px; line-height:1.35; backdrop-filter: blur(6px); }
+  #bar { position:absolute; right:12px; bottom:12px; display:flex; gap:8px; flex-wrap:wrap; align-items:center; background:rgba(0,0,0,.45); padding:10px; border-radius:12px; }
+  #color { width:34px; height:34px; border-radius:8px; border:1px solid rgba(255,255,255,.35); }
+  button, input[type=color] { font-size:14px; padding:10px 12px; border-radius:10px; border:1px solid rgba(255,255,255,.25); background:rgba(255,255,255,.08); color:#fff; }
+  button:active { transform:scale(0.98); }
+  #hint { position:absolute; left:50%; transform:translateX(-50%); bottom:72px; background:rgba(0,0,0,.45); padding:8px 12px; border-radius:10px; font-size:13px; }
+  #toast { position:absolute; left:50%; transform:translateX(-50%); top:14px; background:#1f6feb; color:#fff; padding:8px 12px; border-radius:10px; display:none; }
+  .small { opacity:0.9; font-size:12px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <video id="cam" playsinline autoplay muted></video>
+  <canvas id="out"></canvas>
+  <div id="hud">
+    <div id="last">🗣️ Powiedz: „Zmień kolor na różowy”, „jaśniejszy”, „chłodniejszy”</div>
+    <div id="code" style="margin-top:6px; cursor:pointer;">🎨 <span id="hex">#FF2D96</span> <span id="rgb" class="small">RGB(255,45,150)</span> • stuknij, aby skopiować</div>
+    <div class="small" style="margin-top:6px;">Wskazówka: stuknij ścianę, aby wybrać obszar do malowania (klik = nowy punkt startowy).</div>
+  </div>
+  <div id="bar">
+    <input id="picker" type="color" value="#FF2D96" />
+    <button id="mic">🎤 Start</button>
+    <button id="clear">🧹 Wyczyść maskę</button>
+    <button id="save">💾 Zapisz kadr</button>
+  </div>
+  <div id="hint">Stuknij obszar ściany, aby „chwycić” region. Przeciągnij palcem, by dodać więcej.</div>
+  <div id="toast"></div>
+</div>
+
+<script>
+/* ===== Utils: kolory ===== */
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+function hexToRgb(hex) {
+  hex = hex.replace('#','').trim();
+  if (hex.length === 3) hex = hex.split('').map(c=>c+c).join('');
+  const int = parseInt(hex,16);
+  return {r:(int>>16)&255, g:(int>>8)&255, b:int&255};
+}
+function rgbToHex(r,g,b) {
+  const toHex = v => ('0' + clamp(v,0,255).toString(16)).slice(-2).toUpperCase();
+  return '#' + toHex(r) + toHex(g) + toHex(b);
+}
+function rgbObjToStr({r,g,b}) { return `RGB(${r},${g},${b})`; }
+function adjustHSL({r,g,b}, {dl=0, ds=0, dh=0}) {
+  // RGB[0..255] -> HSL -> modyfikacje -> RGB
+  r/=255; g/=255; b/=255;
+  const max=Math.max(r,g,b), min=Math.min(r,g,b);
+  let h=0,s=0,l=(max+min)/2, d=max-min;
+  if (d!==0) {
+    s = d / (1 - Math.abs(2*l-1));
+    switch(max){
+      case r: h = ((g-b)/d) % 6; break;
+      case g: h = (b-r)/d + 2; break;
+      default: h = (r-g)/d + 4;
+    }
+    h /= 6; if (h<0) h+=1;
+  }
+  l = clamp(l+dl, 0, 1);
+  s = clamp(s+ds, 0, 1);
+  let hdeg = (h*360 + dh) % 360; if (hdeg<0) hdeg += 360;
+  const c = (1 - Math.abs(2*l - 1)) * s, hh = hdeg/60, x = c*(1 - Math.abs(hh % 2 - 1));
+  let r1=0,g1=0,b1=0;
+  if      (0<=hh && hh<1){ r1=c; g1=x; b1=0; }
+  else if (1<=hh && hh<2){ r1=x; g1=c; b1=0; }
+  else if (2<=hh && hh<3){ r1=0; g1=c; b1=x; }
+  else if (3<=hh && hh<4){ r1=0; g1=x; b1=c; }
+  else if (4<=hh && hh<5){ r1=x; g1=0; b1=c; }
+  else                   { r1=c; g1=0; b1=x; }
+  const m = l - c/2;
+  return { r: Math.round((r1+m)*255), g: Math.round((g1+m)*255), b: Math.round((b1+m)*255) };
+}
+
+/* ===== Kamera ===== */
+const video = document.getElementById('cam');
+const canvas = document.getElementById('out');
+const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+async function startCam() {
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' } , width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false
+    });
+    video.srcObject = s;
+    await video.play();
+    resize();
+    requestAnimationFrame(loop);
+  } catch (e) {
+    toast('Brak dostępu do kamery. Nadaj uprawnienia w przeglądarce.');
+    console.error(e);
+  }
+}
+function resize() {
+  const r = video.videoWidth / video.videoHeight || 16/9;
+  canvas.width = video.clientWidth;
+  canvas.height = canvas.width / r;
+  if (canvas.height < video.clientHeight) {
+    canvas.height = video.clientHeight;
+    canvas.width = canvas.height * r;
+  }
+}
+window.addEventListener('resize', resize);
+
+/* ===== Maskowanie ściany (flood fill po podobieństwie koloru) =====
+   - tap = punkt startowy; prog regulowany adaptacyjnie.
+   - mask trzymamy w offscreen, nakładamy blend „multiply” z wybranym kolorem. */
+const maskCanvas = document.createElement('canvas');
+const maskCtx = maskCanvas.getContext('2d', { willReadFrequently: true });
+let maskData = null; // Uint8ClampedArray alfa maski
+let currentColor = hexToRgb('#FF2D96');
+let seedPoints = []; // lista punktów-seedów
+let threshold = 38;  // próg podobieństwa (RGB distance)
+
+function setColorFromHex(hex) {
+  currentColor = hexToRgb(hex);
+  document.getElementById('color').style.background = hex;
+  document.getElementById('hex').textContent = hex.toUpperCase();
+  document.getElementById('rgb').textContent = rgbObjToStr(currentColor);
+}
+function copyColor() {
+  const hex = document.getElementById('hex').textContent;
+  navigator.clipboard?.writeText(hex);
+  toast('Skopiowano: ' + hex);
+}
+
+function buildMask() {
+  if (!video.videoWidth) return;
+  maskCanvas.width = canvas.width;
+  maskCanvas.height = canvas.height;
+  maskCtx.drawImage(video, 0, 0, maskCanvas.width, maskCanvas.height);
+  const img = maskCtx.getImageData(0,0,maskCanvas.width,maskCanvas.height);
+  const data = img.data;
+  const W = img.width, H = img.height;
+  const mask = new Uint8ClampedArray(W*H); // 0..255
+
+  const get = (x,y) => {
+    const i = (y*W + x)*4;
+    return {r:data[i], g:data[i+1], b:data[i+2]};
+  };
+  const dist = (c1,c2) => Math.hypot(c1.r-c2.r, c1.g-c2.g, c1.b-c2.b);
+  const inb = (x,y)=> x>=0 && y>=0 && x<W && y<H;
+
+  const qx = new Uint32Array(W*H);
+  const qy = new Uint32Array(W*H);
+  let qs=0, qe=0;
+
+  function flood(sx, sy) {
+    const ref = get(sx,sy);
+    // adaptacja progu: ciut luźniej dla ciemnych tonów
+    const baseT = threshold + (ref.r+ref.g+ref.b < 200 ? 8 : 0);
+    qs=0; qe=0;
+    qx[qe]=sx; qy[qe]=sy; qe++;
+    while (qs<qe) {
+      const x=qx[qs], y=qy[qs]; qs++;
+      const idx = y*W + x;
+      if (mask[idx]) continue;
+      const c = get(x,y);
+      if (dist(c, ref) > baseT) continue;
+      mask[idx] = 255;
+      // 4-neigh
+      if (inb(x+1,y)) { qx[qe]=x+1; qy[qe]=y; qe++; }
+      if (inb(x-1,y)) { qx[qe]=x-1; qy[qe]=y; qe++; }
+      if (inb(x,y+1)) { qx[qe]=x;   qy[qe]=y+1; qe++; }
+      if (inb(x,y-1)) { qx[qe]=x;   qy[qe]=y-1; qe++; }
+    }
+  }
+
+  seedPoints.forEach(p => flood(p.x, p.y));
+  maskData = mask;
+}
+function clearMask() {
+  seedPoints = [];
+  maskData = null;
+}
+
+/* ===== Render pętla: wideo + nałożenie koloru na maskę (multiply) ===== */
+function loop() {
+  if (video.readyState >= 2) {
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    if (maskData) {
+      const img = ctx.getImageData(0,0,canvas.width, canvas.height);
+      const d = img.data;
+      for (let i=0, px=0; i<d.length; i+=4, px++) {
+        const a = maskData[px]/255; if (a===0) continue;
+        // multiply blend: out = src * color + (1 - a)*src (łagodniejsze przejście)
+        d[i  ] = Math.round(d[i  ] * (1 - a) + (d[i  ] * currentColor.r/255) * a);
+        d[i+1] = Math.round(d[i+1] * (1 - a) + (d[i+1] * currentColor.g/255) * a);
+        d[i+2] = Math.round(d[i+2] * (1 - a) + (d[i+2] * currentColor.b/255) * a);
+      }
+      ctx.putImageData(img, 0, 0);
+    }
+  }
+  requestAnimationFrame(loop);
+}
+
+/* ===== Interakcje: tap/drag do wyboru obszaru ===== */
+function pointerXY(ev) {
+  const rect = canvas.getBoundingClientRect();
+  const x = Math.round(( (ev.touches ? ev.touches[0].clientX : ev.clientX) - rect.left) * canvas.width / rect.width);
+  const y = Math.round(( (ev.touches ? ev.touches[0].clientY : ev.clientY) - rect.top)  * canvas.height/ rect.height);
+  return {x,y};
+}
+let dragAdd = false;
+canvas.addEventListener('click', e => { 
+  const p = pointerXY(e);
+  seedPoints = [p]; // nowy region
+  buildMask();
+  document.getElementById('hint').style.display='none';
+});
+canvas.addEventListener('touchstart', e => { dragAdd=true; const p=pointerXY(e); seedPoints.push(p); buildMask(); document.getElementById('hint').style.display='none'; });
+canvas.addEventListener('touchmove',  e => { if(!dragAdd) return; const p=pointerXY(e); seedPoints.push(p); buildMask(); });
+canvas.addEventListener('touchend',   () => { dragAdd=false; });
+
+/* ===== Mowa (PL) – Web Speech API ===== */
+const lastEl = document.getElementById('last');
+let rec = null, recOn = false;
+
+function supportsSpeech() {
+  return 'webkitSpeechRecognition' in window || 'SpeechRecognition' in window;
+}
+function startRec() {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  rec = new SR();
+  rec.lang = 'pl-PL';
+  rec.continuous = true;
+  rec.interimResults = true;
+  rec.onresult = e => {
+    let t = '';
+    for (let i=e.resultIndex; i<e.results.length; i++) t += e.results[i][0].transcript;
+    t = t.trim();
+    if (t) { lastEl.textContent = '🗣️ ' + t; parseCommand(t); }
+  };
+  rec.onerror = () => { toast('Błąd rozpoznawania mowy'); stopRec(); };
+  rec.onend = () => { recOn = false; micBtn.textContent='🎤 Start'; };
+  rec.start(); recOn = true;
+}
+function stopRec() { if (rec) { rec.stop(); rec=null; } recOn=false; }
+
+function parseCommand(text) {
+  const tx = text.toLowerCase();
+  // HEX / RGB
+  const hexMatch = tx.match(/#?[0-9a-f]{6}\b/i);
+  if (hexMatch) { setColorFromHex(hexMatch[0]); picker.value = document.getElementById('hex').textContent; return; }
+  const rgbMatch = tx.match(/(\d{1,3})[ ,;]+(\d{1,3})[ ,;]+(\d{1,3})/);
+  if (rgbMatch) {
+    const r = clamp(+rgbMatch[1],0,255), g = clamp(+rgbMatch[2],0,255), b = clamp(+rgbMatch[3],0,255);
+    setColorFromHex(rgbToHex(r,g,b)); picker.value = document.getElementById('hex').textContent; return;
+  }
+  // Nazwy kolorów (podstawowe PL)
+  const dict = {
+    'biały':'#FFFFFF','biel':'#FFFFFF','czarny':'#000000','czerwony':'#FF0000','różowy':'#FF2D96','róż':'#FF2D96',
+    'zielony':'#00C853','niebieski':'#2979FF','błękit':'#84C1FF','turkus':'#00A7A7','fiolet':'#8E24AA','purpura':'#8E24AA',
+    'żółty':'#FFEA00','pomarańczowy':'#FF8F00','szary':'#9E9E9E','brązowy':'#795548','beż':'#D1BA9C','bordowy':'#800020',
+    'lawendowy':'#B59BDC','mięta':'#99F3C6','złoty':'#D4AF37','srebrny':'#BDBDBD'
+  };
+  const colorName = Object.keys(dict).find(k => tx.includes(k));
+  if (colorName) { setColorFromHex(dict[colorName]); picker.value = dict[colorName]; return; }
+
+  // Operacje relatywne
+  const amt = tx.includes('troch') ? 0.07 : (tx.includes('mocn')||tx.includes('duż')) ? 0.18 : 0.12;
+  if (tx.includes('jaśniejsz')) { currentColor = adjustHSL(currentColor,{dl: amt}); updateColorUI(); return; }
+  if (tx.includes('ciemniejsz')){ currentColor = adjustHSL(currentColor,{dl:-amt}); updateColorUI(); return; }
+  if (tx.includes('bardziej nasyc') || tx.includes('nasyć')) { currentColor = adjustHSL(currentColor,{ds: amt}); updateColorUI(); return; }
+  if (tx.includes('mniej nasyc') || tx.includes('odsatu')) { currentColor = adjustHSL(currentColor,{ds:-amt}); updateColorUI(); return; }
+  if (tx.includes('cieplejsz')) { currentColor = adjustHSL(currentColor,{dh: +12*amt/0.12}); updateColorUI(); return; }
+  if (tx.includes('chłodniejsz') || tx.includes('zimniejsz')) { currentColor = adjustHSL(currentColor,{dh: -12*amt/0.12}); updateColorUI(); return; }
+
+  // „Zmień kolor na X”
+  if (tx.includes('zmień kolor na') || tx.startsWith('ustaw kolor')) {
+    const after = tx.split('na').pop().trim();
+    if (dict[after]) { setColorFromHex(dict[after]); picker.value = dict[after]; }
+  }
+}
+
+function updateColorUI() {
+  const hex = rgbToHex(currentColor.r, currentColor.g, currentColor.b);
+  setColorFromHex(hex);
+}
+
+/* ===== UI ===== */
+const picker = document.getElementById('picker');
+picker.addEventListener('input', e => setColorFromHex(e.target.value));
+
+document.getElementById('code').addEventListener('click', copyColor);
+document.getElementById('clear').addEventListener('click', () => { clearMask(); toast('Wyczyszczono maskę'); });
+document.getElementById('save').addEventListener('click', () => {
+  const a = document.createElement('a');
+  a.href = canvas.toDataURL('image/png'); a.download = 'recolor.png'; a.click();
+});
+const micBtn = document.getElementById('mic');
+micBtn.addEventListener('click', () => {
+  if (!supportsSpeech()) { toast('Ten browser nie wspiera rozpoznawania mowy.'); return; }
+  if (recOn) { stopRec(); micBtn.textContent='🎤 Start'; }
+  else { startRec(); micBtn.textContent='⏹️ Stop'; }
+});
+
+/* ===== Toast ===== */
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.style.display='block';
+  setTimeout(()=> t.style.display='none', 1800);
+}
+
+/* Start */
+setColorFromHex('#FF2D96');
+startCam();
+</script>
+</body>
+</html>
